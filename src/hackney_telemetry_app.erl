@@ -1,7 +1,7 @@
-%%% @doc hackney_telemetry application.
-%%%
-%%% Installs the middleware on start and removes it on stop.
+%%%-----------------------------------------------------------------------------
+%%% @doc hackney_telemetry application
 %%% @end
+%%%-----------------------------------------------------------------------------
 
 -module(hackney_telemetry_app).
 
@@ -10,11 +10,11 @@
 -export([start/2, prep_stop/1, stop/1]).
 
 start(_StartType, _StartArgs) ->
-    ok = hackney_telemetry:install(),
+    ok = hackney_telemetry_middleware:install(),
     hackney_telemetry_sup:start_link().
 
 prep_stop(State) ->
-    ok = hackney_telemetry:uninstall(),
+    ok = hackney_telemetry_middleware:uninstall(),
     State.
 
 stop(_State) ->

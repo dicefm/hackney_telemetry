@@ -4,21 +4,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.0.0] - Unreleased
+## [0.3.0] - Unreleased
 ### Changed
-- Support hackney 4, which removed `mod_metrics`. Requires hackney 4.8 and OTP 27.
-- The application installs a hackney middleware and a reporter that polls
-  `hackney_pool:get_stats/1`. The `mod_metrics` callbacks are gone.
-- Pool counts are sampled every `report_interval` instead of on every checkout.
+- Support hackney 4, which no longer calls `mod_metrics`. Requires hackney 4.8
+  and OTP 27. A middleware updates the request metrics and a poller reads
+  `hackney_pool:get_stats/1` for the pool metrics.
 
 ### Added
+- `hackney_pool.max` metric.
 - `[hackney, request, start | stop | exception]` span events.
-- `[hackney, checkout_timeout]` event.
-- `max` measurement on `[hackney_pool]`.
-- `[hackney_pool, stats_timeout]` event.
+- `[hackney, checkout_timeout]` and `[hackney_pool, stats_timeout]` events.
 
 ### Removed
-- `queue_count`, `take_rate` and `no_socket`, which hackney 4 can't provide.
+- `hackney_pool.no_socket`, `hackney_pool.queue_count` and
+  `hackney_pool.take_rate`, which hackney 4 can't provide.
 
 ## [0.2.0] - 2024-07-08
 ### Changed

@@ -1,6 +1,6 @@
 {application, hackney_telemetry, [
-    {description, "Telemetry for hackney requests and connection pools"},
-    {vsn, "1.0.0"},
+    {description, "An adapter to export hackney metrics to telemetry"},
+    {vsn, "0.3.0"},
     {registered, []},
     {mod, {hackney_telemetry_app, []}},
     {applications, [kernel, stdlib, telemetry, hackney]},
@@ -10,6 +10,7 @@
     {links, [{"Github", "https://github.com/msramos/hackney_telemetry"}]},
     {files, [
         "src",
+        "include",
         "rebar.config",
         "rebar.lock",
         "CHANGELOG.md",

@@ -6,67 +6,106 @@
 
 # hackney_telemetry
 
-Telemetry for the [Hackney](https://github.com/benoitc/hackney) HTTP client.
+Telemetry adapter for Hackney metrics.
 
-Requires hackney 4.8. Hackney 4 no longer emits metrics itself and expects them
-to come from a [middleware](https://hackney.hexdocs.pm/middleware.html) and
-from `hackney_pool:get_stats/1`. This library is both: when its application
-starts it adds a middleware to hackney's global chain and starts a reporter
-that polls every pool.
+> [!NOTE]
+> This version requires hackney 4.8. Hackney 4 no longer calls a `mod_metrics`
+> module, so this library adds a [middleware](https://hackney.hexdocs.pm/middleware.html)
+> that updates the request metrics and a poller that reads
+> `hackney_pool:get_stats/1` for the pool metrics. For hackney 1.x use 0.2.0.
 
-For hackney 1.x use version 0.2.0, which plugs into hackney's `mod_metrics`.
+This module is a [metrics handler](https://github.com/benoitc/hackney/blob/master/README.md#metrics)
+for the [Hackney](https://github.com/benoitc/hackney) HTTP client. It receives
+calls from Hackney to update metrics and generates [Telemetry](https://github.com/beam-telemetry/telemetry) events.
 
-## Telemetry events
+Hackney supports storing metrics in [Folsom](https://hex.pm/packages/folsom) or
+[Exometer](https://hex.pm/packages/exometer_core). Unfortunately, these
+libraries do not export data in a way that is useful for Telemetry,
+so we need to transform the metrics data before reporting it.
 
-| Event | Measurements | Metadata | Emitted |
-| ----- | ------------ | -------- | ------- |
-| `[hackney, request, start]` | `system_time`, `monotonic_time` | `method`, `host`, `pool` | When a request starts |
-| `[hackney, request, stop]` | `duration`, `monotonic_time` | `method`, `host`, `pool`, `status`, `error` | When a request returns |
-| `[hackney, request, exception]` | `duration`, `monotonic_time` | `method`, `host`, `pool`, `kind`, `reason`, `stacktrace` | When a request raises |
-| `[hackney, checkout_timeout]` | `count` | `host`, `pool` | When a request gets `{error, checkout_timeout}` |
-| `[hackney]` | `nb_requests`, `total_requests`, `finished_requests` | - | Every report interval |
-| `[hackney_pool]` | `max`, `in_use_count`, `free_count` | `pool` | Every report interval, for each pool |
-| `[hackney_pool, stats_timeout]` | `count` | `pool` | When a pool doesn't answer `get_stats/1` in time |
+## Telemetry metrics
 
-`pool` is `none` for requests that don't use a pool. `status` is `undefined` when the request returned an error, or `{ok, Ref}` for
-an async or streaming request. `error` is only set for errors.
+The following metrics are exported by this library to telemetry.
 
-- `nb_requests` counts requests in flight, `total_requests` the requests
-  started and `finished_requests` the ones that returned or raised. Async and
-  streaming requests finish when hackney returns, before the body is read.
-  Each redirect hackney follows counts as a request.
-- Each pool is polled in its own process, so a pool that doesn't answer
-  doesn't delay the others.
-- `max` is the pool's `max_connections`. In hackney 4 it bounds the idle
-  connections kept in the pool, not the connections in use, so `in_use_count`
-  can go above it.
-- `checkout_timeout` means the host reached its `max_per_host` connections,
-  or the pool didn't answer in time.
+| Metric                      | Tags | Meaning                                               |
+| --------------------------- | ---- | ----------------------------------------------------- |
+| `hackney.nb_requests`       | -    | Current number of requests                            |
+| `hackney.finished_requests` | -    | Total number of finished requests                     |
+| `hackney.total_requests`    | -    | Total number of requests                              |
+| `hackney_pool.max`          | pool | Maximum number of idle sockets kept in a pool         |
+| `hackney_pool.free_count`   | pool | Number of free sockets in a connection pool           |
+| `hackney_pool.in_use_count` | pool | Number of busy sockets in a connection pool           |
 
-### Metrics from 0.2.0
+Pool metrics are read every `report_interval` (every second when it's 0). In
+hackney 4, `in_use_count` can go above `max`: `max` bounds the idle sockets,
+not the busy ones.
 
-`nb_requests`, `total_requests`, `finished_requests`, `in_use_count` and
-`free_count` keep their names. The pool counts are now sampled every report
-interval instead of updated on every checkout. Hackney 4 can't provide the
-rest:
+Hackney 4 can't provide `hackney_pool.no_socket`, `hackney_pool.queue_count` or
+`hackney_pool.take_rate`, so they are no longer reported.
 
-- `queue_count`: hackney 4 pools don't queue. `checkout_timeout` is the
-  closest signal.
-- `take_rate` and `no_socket`: hackney 4 has no hook that tells a reused
-  connection from a new one.
+The library also emits these events:
+
+| Event                            | Metadata                                        | Meaning                                               |
+| -------------------------------- | ----------------------------------------------- | ----------------------------------------------------- |
+| `[hackney, request, start]`      | method, host, pool                              | A request started                                     |
+| `[hackney, request, stop]`       | method, host, pool, status, error               | A request returned, with its `duration`               |
+| `[hackney, request, exception]`  | method, host, pool, kind, reason, stacktrace    | A request raised, with its `duration`                 |
+| `[hackney, checkout_timeout]`    | host, pool                                      | A request got `{error, checkout_timeout}`             |
+| `[hackney_pool, stats_timeout]`  | pool                                            | A pool didn't answer `get_stats/1` in time            |
+
+`pool` is `none` for requests that don't use a pool. `status` is `undefined`
+for errors and for async or streaming requests. Don't use `error`, `reason` or
+`stacktrace` as tags.
+
+To use it, make sure that the `hackney_telemetry` application starts before
+your application.
+
+The middleware and the pool poller call this module to update metrics, as
+hackney 1.x did through `mod_metrics`. This module passes the data to a
+`hackney_telemetry_worker` which keeps the current state of the metric and
+generates Telemetry events.
+
+Requests that set their own `middleware` option replace hackney's global chain,
+so they are not counted.
+
+A worker process has two jobs:
+
+1.  Calculate metric values
+
+    Hackney does not keep the state of its metrics, but instead emits events to
+    the metrics engine, like "increase this counter by 1", "set this gauge to X",
+    "add Y to this histogram". The job of a metric worker is to process these
+    events and keep up-to-date state representing the value of the tracked metric.
+    State updates run in constant time (O(1)), important since a single
+    request generates about nine metric updates.
+
+2.  Send metric values to Telemetry
+
+    If we send the metric value to Telemetry after every update, then
+    telemetry processing may not be able to keep up, and Telemetry will apply
+    backpressure.
+
+    Since the worker maintains the most up-to-date value, we can send the current
+    value periodically. Gauge metrics may be less accurate, but it avoids overload.
 
 ## Installation
 
-Add it to your dependencies and make sure the `hackney_telemetry` application
-starts. Nothing else needs configuring.
-
-Requests that set their own `middleware` option replace the global chain, so
-they are not counted.
+Install it from [Hex](https://hex.pm/packages/hackney_telemetry) or
+[Github](https://github.com/msramos/hackney_telemetry).
 
 ## Configuration
 
-`report_interval` sets how often the reporter runs, in milliseconds. It
-defaults to 1000. Set it to 0 to disable the reporter.
+No hackney configuration is needed: the application installs its middleware
+when it starts.
+
+### Options
+
+#### Report interval
+
+By default, workers will report data to telemetry every 1000 milliseconds.
+If set to 0, events are generated after every update.
+
+You can change that by setting the `report_interval` option:
 
 **Erlang**
 
@@ -82,34 +121,37 @@ config :hackney_telemetry, report_interval: 2_000
 
 ## Usage
 
-Handle the events in your application, or use a reporter such as
-[Telemetry.Metrics](https://hex.pm/packages/telemetry_metrics):
+After installing the module, your application will receive Telemetry events.
+You can handle them in your application, or install a reporting module such
+as [Telemetry.Metrics](https://hex.pm/packages/telemetry_metrics)
+or [prom_ex](https://hex.pm/packages/prom_ex).
+
+## Elixir
 
 ```elixir
-defmodule YourApplication.Telemetry do
+defmodule YourApplcation.Telemetry do
   import Telemetry.Metrics
 
   def metrics do
-    [
-      last_value("hackney.nb_requests"),
-      last_value("hackney.finished_requests"),
-      last_value("hackney.total_requests"),
-      last_value("hackney_pool.max", tags: [:pool]),
-      last_value("hackney_pool.in_use_count", tags: [:pool]),
-      last_value("hackney_pool.free_count", tags: [:pool]),
-      counter("hackney_pool.stats_timeout.count", tags: [:pool]),
-      counter("hackney.checkout_timeout.count", tags: [:host, :pool]),
-      counter("hackney.request.exception.duration", tags: [:host, :pool]),
-      distribution("hackney.request.stop.duration",
-        unit: {:native, :millisecond},
-        tags: [:host, :pool, :status]
-      )
-    ]
+  [
+    # other metrics
+
+    last_value("hackney.nb_requests"),
+    last_value("hackney.finished_requests"),
+    last_value("hackney.total_requests"),
+    last_value("hackney_pool.max", tags: [:pool]),
+    last_value("hackney_pool.free_count", tags: [:pool]),
+    last_value("hackney_pool.in_use_count", tags: [:pool]),
+    counter("hackney_pool.stats_timeout.count", tags: [:pool]),
+    counter("hackney.checkout_timeout.count", tags: [:host, :pool]),
+    distribution("hackney.request.stop.duration",
+      unit: {:native, :millisecond},
+      tags: [:host, :pool, :status]
+    )
+  ]
   end
 end
 ```
-
-Don't use `error`, `reason` or `stacktrace` as tags: they have unbounded values.
 
 ## Building
 
