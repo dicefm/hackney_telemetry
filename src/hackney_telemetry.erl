@@ -10,8 +10,9 @@
 %%% `{error, checkout_timeout}'.
 %%%
 %%% `report/0' emits the request counts as `[hackney]' and the stats of each
-%%% pool as `[hackney_pool]'. When a pool doesn't answer in time it emits
-%%% `[hackney_pool, stats_timeout]' instead.
+%%% pool as `[hackney_pool]'. Each pool is polled in its own process, so a
+%%% stuck pool doesn't delay the others. When a pool doesn't answer in time it
+%%% emits `[hackney_pool, stats_timeout]' instead.
 %%% @end
 
 -module(hackney_telemetry).
@@ -21,9 +22,8 @@
 -include_lib("hackney/include/hackney_lib.hrl").
 
 -define(COUNTERS, {?MODULE, counters}).
--define(IN_FLIGHT, 1).
--define(TOTAL, 2).
--define(FINISHED, 3).
+-define(TOTAL, 1).
+-define(FINISHED, 2).
 
 %% @doc Add the middleware to the front of hackney's global chain.
 %%
@@ -32,7 +32,7 @@
 -spec install() -> ok.
 install() ->
     case persistent_term:get(?COUNTERS, undefined) of
-        undefined -> persistent_term:put(?COUNTERS, counters:new(3, [write_concurrency]));
+        undefined -> persistent_term:put(?COUNTERS, counters:new(2, [write_concurrency]));
         _Counters -> ok
     end,
     application:set_env(hackney, middleware, [middleware() | other_middleware()]).
@@ -58,10 +58,17 @@ call(Request, Next) ->
     end.
 
 %% @doc Emit the request counts and the stats of every hackney pool.
+%%
+%% The request counts are emitted before it returns. Pool stats are emitted
+%% from one process per pool, which may finish after it returns.
+%% @end
 -spec report() -> ok.
 report() ->
     report_requests(),
-    lists:foreach(fun({Pool, _Pid}) -> report_pool(Pool) end, ets:tab2list(hackney_pool)).
+    lists:foreach(
+        fun(Pool) -> proc_lib:spawn(fun() -> report_pool(Pool) end) end,
+        pools()
+    ).
 
 %% Internal
 
@@ -75,36 +82,45 @@ other_middleware() ->
     end.
 
 count(Counters, Request, Next) ->
-    counters:add(Counters, ?IN_FLIGHT, 1),
     counters:add(Counters, ?TOTAL, 1),
     try
         span(Request, Next)
     after
-        counters:sub(Counters, ?IN_FLIGHT, 1),
         counters:add(Counters, ?FINISHED, 1)
     end.
 
 span(#{method := Method, url := #hackney_url{host = Host}, options := Options} = Request, Next) ->
-    Metadata = #{
-        method => Method,
-        host => unicode:characters_to_binary(Host),
-        pool => proplists:get_value(pool, Options, default)
-    },
+    Metadata = #{method => Method, host => list_to_binary(Host), pool => pool(Options)},
     telemetry:span([hackney, request], Metadata, fun() ->
         Response = Next(Request),
-        {Response, maps:merge(Metadata, response_metadata(Response, Metadata))}
+        Response =:= {error, checkout_timeout} andalso
+            telemetry:execute(
+                [hackney, checkout_timeout], #{count => 1}, maps:remove(method, Metadata)
+            ),
+        {Response, maps:merge(Metadata, response_metadata(Response))}
     end).
 
-response_metadata({ok, Status, _Headers, _Body}, _Metadata) ->
+% Same rules hackney uses to pick the pool of a request.
+pool(Options) ->
+    case proplists:get_value(pool, Options) of
+        false ->
+            none;
+        undefined ->
+            case application:get_env(hackney, use_default_pool, true) of
+                false -> none;
+                _ -> default
+            end;
+        Pool ->
+            Pool
+    end.
+
+response_metadata({ok, Status, _Headers, _Body}) ->
     #{status => Status};
-response_metadata({ok, Status, _Headers}, _Metadata) ->
+response_metadata({ok, Status, _Headers}) ->
     #{status => Status};
-response_metadata({error, checkout_timeout}, Metadata) ->
-    telemetry:execute([hackney, checkout_timeout], #{count => 1}, maps:remove(method, Metadata)),
-    #{status => undefined, error => checkout_timeout};
-response_metadata({error, Reason}, _Metadata) ->
+response_metadata({error, Reason}) ->
     #{status => undefined, error => Reason};
-response_metadata(_Async, _Metadata) ->
+response_metadata(_Async) ->
     #{status => undefined}.
 
 report_requests() ->
@@ -112,15 +128,26 @@ report_requests() ->
         undefined ->
             ok;
         Counters ->
+            % Read finished first so nb_requests can't go negative.
+            Finished = counters:get(Counters, ?FINISHED),
+            Total = counters:get(Counters, ?TOTAL),
             telemetry:execute(
                 [hackney],
                 #{
-                    nb_requests => counters:get(Counters, ?IN_FLIGHT),
-                    total_requests => counters:get(Counters, ?TOTAL),
-                    finished_requests => counters:get(Counters, ?FINISHED)
+                    nb_requests => Total - Finished,
+                    total_requests => Total,
+                    finished_requests => Finished
                 },
                 #{}
             )
+    end.
+
+% hackney has no function that lists pools, so read the table it keeps them in.
+pools() ->
+    try ets:tab2list(hackney_pool) of
+        Entries -> [Pool || {Pool, _Pid} <- Entries]
+    catch
+        error:badarg -> []
     end.
 
 report_pool(Pool) ->

@@ -1,7 +1,4 @@
 %%% @doc Calls `hackney_telemetry:report/0' every `ReportInterval' milliseconds.
-%%%
-%%% The next report is scheduled once the current one finishes, so a slow pool
-%%% delays reports instead of piling them up. An interval of 0 disables it.
 %%% @end
 
 -module(hackney_telemetry_reporter).
@@ -11,7 +8,7 @@
 -export([start_link/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
--spec start_link(non_neg_integer()) -> gen_server:start_ret().
+-spec start_link(pos_integer()) -> gen_server:start_ret().
 start_link(ReportInterval) ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, ReportInterval, []).
 
@@ -32,8 +29,6 @@ handle_info(report, ReportInterval) ->
 handle_info(_Message, ReportInterval) ->
     {noreply, ReportInterval}.
 
-schedule(0) ->
-    ok;
 schedule(ReportInterval) ->
     erlang:send_after(ReportInterval, self(), report),
     ok.

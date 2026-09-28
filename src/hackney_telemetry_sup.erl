@@ -13,10 +13,14 @@ start_link() ->
 init([]) ->
     {ok, ReportInterval} = application:get_env(hackney_telemetry, report_interval),
     SupFlags = #{strategy => one_for_one, intensity => 3, period => 5},
-    ChildSpecs = [
+    {ok, {SupFlags, child_specs(ReportInterval)}}.
+
+child_specs(0) ->
+    [];
+child_specs(ReportInterval) ->
+    [
         #{
             id => hackney_telemetry_reporter,
             start => {hackney_telemetry_reporter, start_link, [ReportInterval]}
         }
-    ],
-    {ok, {SupFlags, ChildSpecs}}.
+    ].

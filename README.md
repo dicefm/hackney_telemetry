@@ -8,7 +8,7 @@
 
 Telemetry for the [Hackney](https://github.com/benoitc/hackney) HTTP client.
 
-Requires hackney 4. Hackney 4 no longer emits metrics itself and expects them
+Requires hackney 4.8. Hackney 4 no longer emits metrics itself and expects them
 to come from a [middleware](https://hackney.hexdocs.pm/middleware.html) and
 from `hackney_pool:get_stats/1`. This library is both: when its application
 starts it adds a middleware to hackney's global chain and starts a reporter
@@ -28,13 +28,15 @@ For hackney 1.x use version 0.2.0, which plugs into hackney's `mod_metrics`.
 | `[hackney_pool]` | `max`, `in_use_count`, `free_count` | `pool` | Every report interval, for each pool |
 | `[hackney_pool, stats_timeout]` | `count` | `pool` | When a pool doesn't answer `get_stats/1` in time |
 
-`status` is `undefined` when the request returned an error, or `{ok, Ref}` for
+`pool` is `none` for requests that don't use a pool. `status` is `undefined` when the request returned an error, or `{ok, Ref}` for
 an async or streaming request. `error` is only set for errors.
 
 - `nb_requests` counts requests in flight, `total_requests` the requests
   started and `finished_requests` the ones that returned or raised. Async and
   streaming requests finish when hackney returns, before the body is read.
   Each redirect hackney follows counts as a request.
+- Each pool is polled in its own process, so a pool that doesn't answer
+  doesn't delay the others.
 - `max` is the pool's `max_connections`. In hackney 4 it bounds the idle
   connections kept in the pool, not the connections in use, so `in_use_count`
   can go above it.

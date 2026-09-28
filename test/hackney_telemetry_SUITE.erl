@@ -30,12 +30,14 @@ all() ->
         emits_request_span_for_head_and_async,
         emits_exception_for_request_that_raises,
         emits_checkout_timeout,
+        tags_request_without_pool_as_none,
         passes_through_before_install,
         reports_pool_stats,
         skips_pool_that_stopped,
         reports_pool_stats_timeout,
+        reports_nothing_for_pools_without_hackney,
         reporter_reports_periodically,
-        reporter_with_zero_interval_does_not_report
+        zero_interval_starts_no_reporter
     ].
 
 init_per_suite(Config) ->
@@ -176,6 +178,23 @@ emits_checkout_timeout(_Config) ->
     after 100 -> ct:fail(checkout_timeout_not_received)
     end.
 
+tags_request_without_pool_as_none(_Config) ->
+    hackney_telemetry:call(request([{pool, false}]), fun(_) -> {ok, 200, [], <<>>} end),
+    receive
+        {[hackney, request, stop], _, #{pool := none}} -> ok
+    after 100 -> ct:fail(stop_not_received)
+    end,
+    application:set_env(hackney, use_default_pool, false),
+    try
+        hackney_telemetry:call(request([]), fun(_) -> {ok, 200, [], <<>>} end),
+        receive
+            {[hackney, request, stop], _, #{pool := none}} -> ok
+        after 100 -> ct:fail(stop_not_received)
+        end
+    after
+        application:unset_env(hackney, use_default_pool)
+    end.
+
 passes_through_before_install(_Config) ->
     Counters = persistent_term:get({hackney_telemetry, counters}),
     persistent_term:erase({hackney_telemetry, counters}),
@@ -219,7 +238,7 @@ skips_pool_that_stopped(_Config) ->
         ok = hackney_telemetry:report(),
         receive
             {[hackney_pool | _], _, #{pool := Pool}} = Event -> ct:fail({unexpected_event, Event})
-        after 0 -> ok
+        after 50 -> ok
         end
     after
         ets:delete(hackney_pool, Pool)
@@ -237,11 +256,20 @@ reports_pool_stats_timeout(_Config) ->
         ok = hackney_telemetry:report(),
         receive
             {[hackney_pool, stats_timeout], #{count := 1}, #{pool := Pool}} -> ok
-        after 100 -> ct:fail(stats_timeout_not_received)
+        after 6000 -> ct:fail(stats_timeout_not_received)
         end
     after
         ets:delete(hackney_pool, Pool),
         Pid ! stop
+    end.
+
+reports_nothing_for_pools_without_hackney(_Config) ->
+    ok = application:stop(hackney_telemetry),
+    ok = application:stop(hackney),
+    try
+        ok = hackney_telemetry:report()
+    after
+        {ok, _} = application:ensure_all_started(hackney_telemetry)
     end.
 
 %% Reporter
@@ -249,6 +277,9 @@ reports_pool_stats_timeout(_Config) ->
 reporter_reports_periodically(_Config) ->
     {ok, Pid} = gen_server:start(hackney_telemetry_reporter, 10, []),
     try
+        ok = gen_server:call(Pid, unexpected),
+        ok = gen_server:cast(Pid, unexpected),
+        Pid ! unexpected,
         receive
             {[hackney], #{total_requests := _}, _} -> ok
         after 200 -> ct:fail(report_not_received)
@@ -257,19 +288,13 @@ reporter_reports_periodically(_Config) ->
         gen_server:stop(Pid)
     end.
 
-reporter_with_zero_interval_does_not_report(_Config) ->
-    {ok, Pid} = gen_server:start(hackney_telemetry_reporter, 0, []),
+zero_interval_starts_no_reporter(_Config) ->
+    {ok, ReportInterval} = application:get_env(hackney_telemetry, report_interval),
+    application:set_env(hackney_telemetry, report_interval, 0),
     try
-        ok = gen_server:call(Pid, unexpected),
-        ok = gen_server:cast(Pid, unexpected),
-        Pid ! unexpected,
-        true = is_process_alive(Pid),
-        receive
-            {[hackney], _, _} = Event -> ct:fail({unexpected_event, Event})
-        after 50 -> ok
-        end
+        {ok, {_SupFlags, []}} = hackney_telemetry_sup:init([])
     after
-        gen_server:stop(Pid)
+        application:set_env(hackney_telemetry, report_interval, ReportInterval)
     end.
 
 %% Helpers

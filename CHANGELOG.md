@@ -6,7 +6,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.0.0] - Unreleased
 ### Changed
-- Support hackney 4, which removed `mod_metrics`. Requires hackney 4 and OTP 27.
+- Support hackney 4, which removed `mod_metrics`. Requires hackney 4.8 and OTP 27.
 - The application installs a hackney middleware and a reporter that polls
   `hackney_pool:get_stats/1`. The `mod_metrics` callbacks are gone.
 - Pool counts are sampled every `report_interval` instead of on every checkout.

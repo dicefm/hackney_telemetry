@@ -10,7 +10,6 @@
     {links, [{"Github", "https://github.com/msramos/hackney_telemetry"}]},
     {files, [
         "src",
-        "include",
         "rebar.config",
         "rebar.lock",
         "CHANGELOG.md",
