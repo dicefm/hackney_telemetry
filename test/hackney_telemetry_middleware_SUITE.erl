@@ -17,10 +17,11 @@ all() ->
         installs_middleware_on_start,
         install_keeps_other_middleware,
         uninstall_keeps_other_middleware,
-        stopping_the_application_removes_middleware,
+        passes_through_while_application_is_stopped,
         counts_requests_made_through_hackney,
         counts_request_as_in_flight_until_it_finishes,
         counts_request_that_raises_as_finished,
+        finishes_requests_of_killed_processes,
         emits_request_span,
         emits_request_span_for_error,
         emits_request_span_for_head_and_async,
@@ -73,11 +74,19 @@ uninstall_keeps_other_middleware(_Config) ->
     ok = hackney_telemetry_middleware:uninstall(),
     undefined = application:get_env(hackney, middleware).
 
-stopping_the_application_removes_middleware(_Config) ->
+passes_through_while_application_is_stopped(_Config) ->
     ok = application:stop(hackney_telemetry),
-    undefined = application:get_env(hackney, middleware),
-    ok = application:start(hackney_telemetry),
-    {ok, [_]} = application:get_env(hackney, middleware).
+    try
+        {ok, 200, [], <<>>} = hackney_telemetry_middleware:call(request([]), fun(_) ->
+            {ok, 200, [], <<>>}
+        end),
+        receive
+            {[hackney | _], _, _} = Event -> ct:fail({unexpected_event, Event})
+        after 50 -> ok
+        end
+    after
+        ok = application:start(hackney_telemetry)
+    end.
 
 %% Counters
 
@@ -87,20 +96,51 @@ counts_requests_made_through_hackney(_Config) ->
     receive_measurement(finished_requests).
 
 counts_request_as_in_flight_until_it_finishes(_Config) ->
+    Before = in_flight(),
     {ok, 200, [], <<>>} = hackney_telemetry_middleware:call(request([]), fun(_) ->
+        InFlight = Before + 1,
+        InFlight = in_flight(),
         {ok, 200, [], <<>>}
     end),
-    InFlight = receive_measurement(nb_requests),
-    Finished = InFlight - 1,
-    Finished = receive_measurement(nb_requests).
+    Before = in_flight().
 
 counts_request_that_raises_as_finished(_Config) ->
+    Before = in_flight(),
     {'EXIT', {boom, _}} =
         (catch hackney_telemetry_middleware:call(request([]), fun(_) -> error(boom) end)),
-    InFlight = receive_measurement(nb_requests),
-    Finished = InFlight - 1,
-    Finished = receive_measurement(nb_requests),
-    receive_measurement(finished_requests).
+    receive_measurement(finished_requests),
+    Before = in_flight().
+
+finishes_requests_of_killed_processes(_Config) ->
+    Before = in_flight(),
+    Self = self(),
+    Pids = [
+        spawn(fun() ->
+            hackney_telemetry_middleware:call(request([]), fun(_) ->
+                Self ! started,
+                timer:sleep(infinity)
+            end)
+        end)
+     || _ <- [1, 2]
+    ],
+    [
+        receive
+            started -> ok
+        end
+     || _ <- Pids
+    ],
+    InFlight = Before + 2,
+    InFlight = in_flight(),
+    [Shutdown, Kill] = Pids,
+    exit(Shutdown, shutdown),
+    exit(Kill, kill),
+    wait_until_dead(Pids),
+    flush(),
+    Before = in_flight(),
+    receive
+        {[hackney], #{finished_requests := _}, #{}} -> ok
+    after 100 -> ct:fail(finished_requests_not_received)
+    end.
 
 %% Span
 
@@ -199,6 +239,36 @@ request(Options) ->
         body => <<>>,
         options => Options
     }.
+
+% Poll, then take the last nb_requests reported, which is from this poll or a
+% later one.
+in_flight() ->
+    flush(),
+    ok = hackney_telemetry_pool_poller:poll(),
+    last_in_flight(undefined).
+
+last_in_flight(Value) ->
+    receive
+        {[hackney], #{nb_requests := NewValue}, #{}} -> last_in_flight(NewValue)
+    after 50 ->
+        Value =/= undefined orelse ct:fail(nb_requests_not_received),
+        Value
+    end.
+
+flush() ->
+    receive
+        {[hackney], _, _} -> flush()
+    after 0 -> ok
+    end.
+
+wait_until_dead(Pids) ->
+    case lists:any(fun erlang:is_process_alive/1, Pids) of
+        true ->
+            timer:sleep(1),
+            wait_until_dead(Pids);
+        false ->
+            ok
+    end.
 
 receive_measurement(Key) ->
     receive

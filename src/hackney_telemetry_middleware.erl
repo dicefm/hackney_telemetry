@@ -7,16 +7,25 @@
 %%% - [hackney, total_requests]
 %%% - [hackney, finished_requests]
 %%%
+%%% Requests in flight are kept in an ETS table with the process that made
+%%% them. A process can be killed before the middleware sees its request
+%%% finish, so `sweep/0' finishes the requests of dead processes and sets
+%%% `nb_requests' to the number still in flight. The pool poller calls it.
+%%%
 %%% It also wraps each request in a `[hackney, request]' span and emits
 %%% `[hackney, checkout_timeout]' when a request gets
 %%% `{error, checkout_timeout}'.
+%%%
+%%% Requests pass through untouched while the application isn't running.
 %%% @end
 
 -module(hackney_telemetry_middleware).
 
--export([install/0, uninstall/0, call/2]).
+-export([install/0, uninstall/0, call/2, new_table/0, sweep/0]).
 
 -include_lib("hackney/include/hackney_lib.hrl").
+
+-define(REQUESTS, hackney_telemetry_requests).
 
 %% @doc Add the middleware to the front of hackney's global chain.
 %%
@@ -41,12 +50,39 @@ uninstall() ->
 -spec call(hackney_middleware:request(), hackney_middleware:next()) ->
     hackney_middleware:response().
 call(Request, Next) ->
-    hackney_telemetry:increment_counter([hackney, nb_requests]),
+    Ref = make_ref(),
+    try ets:insert(?REQUESTS, {Ref, self()}) of
+        true -> count(Ref, Request, Next)
+    catch
+        % The application isn't running.
+        error:badarg -> Next(Request)
+    end.
+
+%% @doc Create the table of requests in flight, owned by the calling process.
+
+-spec new_table() -> ok.
+new_table() ->
+    ?REQUESTS = ets:new(?REQUESTS, [
+        set, public, named_table, {write_concurrency, auto}, {decentralized_counters, true}
+    ]),
+    ok.
+
+%% @doc Finish the requests of dead processes and report `nb_requests'.
+
+-spec sweep() -> ok.
+sweep() ->
+    Dead = [Ref || {Ref, Pid} <- ets:tab2list(?REQUESTS), not is_process_alive(Pid)],
+    lists:foreach(fun(Ref) -> ets:delete(?REQUESTS, Ref) end, Dead),
+    Dead =/= [] andalso
+        hackney_telemetry:increment_counter([hackney, finished_requests], length(Dead)),
+    hackney_telemetry:update_gauge([hackney, nb_requests], ets:info(?REQUESTS, size)).
+
+count(Ref, Request, Next) ->
     hackney_telemetry:increment_counter([hackney, total_requests]),
     try
         span(Request, Next)
     after
-        hackney_telemetry:decrement_counter([hackney, nb_requests]),
+        ets:delete(?REQUESTS, Ref),
         hackney_telemetry:increment_counter([hackney, finished_requests])
     end.
 

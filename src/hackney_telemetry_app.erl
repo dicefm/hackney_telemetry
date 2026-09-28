@@ -7,15 +7,11 @@
 
 -behaviour(application).
 
--export([start/2, prep_stop/1, stop/1]).
+-export([start/2, stop/1]).
 
 start(_StartType, _StartArgs) ->
     ok = hackney_telemetry_middleware:install(),
     hackney_telemetry_sup:start_link().
-
-prep_stop(State) ->
-    ok = hackney_telemetry_middleware:uninstall(),
-    State.
 
 stop(_State) ->
     ok.

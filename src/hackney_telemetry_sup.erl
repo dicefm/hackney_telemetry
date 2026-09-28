@@ -18,6 +18,7 @@ start_link() ->
     supervisor:start_link({local, ?SERVER}, ?MODULE, []).
 
 init([]) ->
+    ok = hackney_telemetry_middleware:new_table(),
     SupFlags =
         #{
             strategy => one_for_one,

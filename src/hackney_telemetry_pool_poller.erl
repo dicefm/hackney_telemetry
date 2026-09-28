@@ -13,6 +13,8 @@
 %%% doesn't answer doesn't delay the others. When a pool doesn't answer in time
 %%% it emits `[hackney_pool, stats_timeout]'.
 %%%
+%%% On each poll it also calls `hackney_telemetry_middleware:sweep/0'.
+%%%
 %%% It polls every `report_interval' milliseconds, or every second when
 %%% `report_interval' is 0.
 %%% @end
@@ -60,6 +62,7 @@ handle_info(_Message, Pools) ->
     {noreply, Pools}.
 
 poll(KnownPools) ->
+    hackney_telemetry_middleware:sweep(),
     Pools = pools(),
     lists:foreach(
         fun(Pool) -> for_each_metric(Pool, fun hackney_telemetry:delete/1) end, KnownPools -- Pools

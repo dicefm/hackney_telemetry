@@ -36,7 +36,9 @@ The following metrics are exported by this library to telemetry.
 | `hackney_pool.free_count`   | pool | Number of free sockets in a connection pool           |
 | `hackney_pool.in_use_count` | pool | Number of busy sockets in a connection pool           |
 
-Pool metrics are read every `report_interval` (every second when it's 0). In
+Pool metrics and `nb_requests` are read every `report_interval` (every second
+when it's 0). A request whose process is killed before it returns counts as
+finished at the next read. In
 hackney 4, `in_use_count` can go above `max`: `max` bounds the idle sockets,
 not the busy ones.
 
