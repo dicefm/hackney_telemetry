@@ -19,6 +19,7 @@ all() ->
         uninstall_keeps_other_middleware,
         passes_through_while_application_is_stopped,
         returns_response_when_application_stops_mid_request,
+        does_not_finish_request_started_before_a_restart,
         counts_requests_made_through_hackney,
         counts_request_as_in_flight_until_it_finishes,
         counts_request_that_raises_as_finished,
@@ -28,6 +29,7 @@ all() ->
         emits_request_span_for_head_and_async,
         emits_exception_for_request_that_raises,
         emits_checkout_timeout,
+        emits_checkout_timeout_once_across_redirects,
         tags_request_without_pool_as_none
     ].
 
@@ -112,6 +114,33 @@ returns_response_when_application_stops_mid_request(_Config) ->
         end
     after
         ok = application:start(hackney_telemetry)
+    end.
+
+does_not_finish_request_started_before_a_restart(_Config) ->
+    Self = self(),
+    Caller = spawn(fun() ->
+        Response = hackney_telemetry:call(request([]), fun(_) ->
+            Self ! started,
+            receive
+                continue -> {ok, 200, [], <<>>}
+            end
+        end),
+        Self ! {response, Response}
+    end),
+    receive
+        started -> ok
+    end,
+    ok = application:stop(hackney_telemetry),
+    ok = application:start(hackney_telemetry),
+    flush(),
+    Caller ! continue,
+    receive
+        {response, Response} -> {ok, 200, [], <<>>} = Response
+    after 100 -> ct:fail(response_not_received)
+    end,
+    receive
+        {[hackney], #{finished_requests := _}, _} = Event -> ct:fail({unexpected_event, Event})
+    after 50 -> ok
     end.
 
 %% Counters
@@ -229,6 +258,30 @@ emits_checkout_timeout(_Config) ->
             #{count := 1} = Measurements,
             #{pool := stripe, host := <<"api.example.com">>} = Metadata
     after 100 -> ct:fail(checkout_timeout_not_received)
+    end.
+
+emits_checkout_timeout_once_across_redirects(_Config) ->
+    Redirect = maps:merge(request([{redirect_count, 1}]), #{
+        url => hackney_url:parse_url(<<"https://redirected.example.com/charges">>)
+    }),
+    Timeout = fun() ->
+        hackney_telemetry:call(request([]), fun(_) ->
+            hackney_telemetry:call(Redirect, fun(_) -> {error, checkout_timeout} end)
+        end)
+    end,
+    {error, checkout_timeout} = Timeout(),
+    receive
+        {[hackney, checkout_timeout], _, #{host := <<"redirected.example.com">>}} -> ok
+    after 100 -> ct:fail(checkout_timeout_not_received)
+    end,
+    receive
+        {[hackney, checkout_timeout], _, _} = Event -> ct:fail({unexpected_event, Event})
+    after 50 -> ok
+    end,
+    {error, checkout_timeout} = Timeout(),
+    receive
+        {[hackney, checkout_timeout], _, _} -> ok
+    after 100 -> ct:fail(checkout_timeout_not_received_again)
     end.
 
 tags_request_without_pool_as_none(_Config) ->

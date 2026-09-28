@@ -28,6 +28,7 @@
 -include("hackney_telemetry.hrl").
 
 -define(REQUESTS, hackney_telemetry_requests).
+-define(CHECKOUT_TIMEOUT_REPORTED, {?MODULE, checkout_timeout_reported}).
 
 %% @doc Add the middleware to the front of hackney's global chain.
 %%
@@ -79,22 +80,27 @@ sweep() ->
         increment([hackney, finished_requests], length(Dead)),
     set([hackney, nb_requests], ets:info(?REQUESTS, size)).
 
-count(Ref, Request, Next) ->
+count(Ref, #{options := Options} = Request, Next) ->
     increment([hackney, total_requests], 1),
     try
         span(Request, Next)
     after
-        finish(Ref)
+        finish(Ref),
+        % hackney sets redirect_count on the requests it makes to follow a
+        % redirect, so a request without it is the one the caller made.
+        proplists:is_defined(redirect_count, Options) orelse
+            erase(?CHECKOUT_TIMEOUT_REPORTED)
     end.
 
+% The request only counts as finished if it's still in the table. It isn't when
+% the application stopped, or restarted, while the request was in flight.
 finish(Ref) ->
-    try
-        ets:delete(?REQUESTS, Ref)
+    try ets:take(?REQUESTS, Ref) of
+        [_] -> increment([hackney, finished_requests], 1);
+        [] -> ok
     catch
-        % The application stopped while the request was in flight.
         error:badarg -> ok
-    end,
-    increment([hackney, finished_requests], 1).
+    end.
 
 middleware() ->
     fun ?MODULE:call/2.
@@ -109,12 +115,22 @@ span(#{method := Method, url := #hackney_url{host = Host}, options := Options} =
     Metadata = #{method => Method, host => list_to_binary(Host), pool => pool(Options)},
     telemetry:span([hackney, request], Metadata, fun() ->
         Response = Next(Request),
-        Response =:= {error, checkout_timeout} andalso
-            telemetry:execute(
-                [hackney, checkout_timeout], #{count => 1}, maps:remove(method, Metadata)
-            ),
+        Response =:= {error, checkout_timeout} andalso checkout_timeout(Metadata),
         {Response, maps:merge(Metadata, response_metadata(Response))}
     end).
+
+% hackney follows a redirect with a nested request that goes through this
+% middleware again and returns its error unchanged. Report a checkout timeout
+% once, from the request it happened in.
+checkout_timeout(Metadata) ->
+    case put(?CHECKOUT_TIMEOUT_REPORTED, true) of
+        true ->
+            ok;
+        undefined ->
+            telemetry:execute(
+                [hackney, checkout_timeout], #{count => 1}, maps:remove(method, Metadata)
+            )
+    end.
 
 % Same rules hackney uses to pick the pool of a request.
 pool(Options) ->
