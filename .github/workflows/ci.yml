@@ -35,9 +35,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-otp-${{ matrix.otp }}-
 
-      - name: Remove cached build of this project
-        run: rm -rf _build/*/lib/hackney_telemetry
-
       - name: Check formatting
         run: rebar3 fmt --check
 
