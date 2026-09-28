@@ -82,9 +82,17 @@ count(Ref, Request, Next) ->
     try
         span(Request, Next)
     after
-        ets:delete(?REQUESTS, Ref),
-        hackney_telemetry:increment_counter([hackney, finished_requests])
+        finish(Ref)
     end.
+
+finish(Ref) ->
+    try
+        ets:delete(?REQUESTS, Ref)
+    catch
+        % The application stopped while the request was in flight.
+        error:badarg -> ok
+    end,
+    hackney_telemetry:increment_counter([hackney, finished_requests]).
 
 middleware() ->
     fun ?MODULE:call/2.

@@ -18,6 +18,7 @@ all() ->
         install_keeps_other_middleware,
         uninstall_keeps_other_middleware,
         passes_through_while_application_is_stopped,
+        returns_response_when_application_stops_mid_request,
         counts_requests_made_through_hackney,
         counts_request_as_in_flight_until_it_finishes,
         counts_request_that_raises_as_finished,
@@ -83,6 +84,31 @@ passes_through_while_application_is_stopped(_Config) ->
         receive
             {[hackney | _], _, _} = Event -> ct:fail({unexpected_event, Event})
         after 50 -> ok
+        end
+    after
+        ok = application:start(hackney_telemetry)
+    end.
+
+returns_response_when_application_stops_mid_request(_Config) ->
+    Self = self(),
+    Caller = spawn(fun() ->
+        Response = hackney_telemetry_middleware:call(request([]), fun(_) ->
+            Self ! started,
+            receive
+                continue -> {ok, 200, [], <<>>}
+            end
+        end),
+        Self ! {response, Response}
+    end),
+    receive
+        started -> ok
+    end,
+    ok = application:stop(hackney_telemetry),
+    try
+        Caller ! continue,
+        receive
+            {response, Response} -> {ok, 200, [], <<>>} = Response
+        after 100 -> ct:fail(response_not_received)
         end
     after
         ok = application:start(hackney_telemetry)
