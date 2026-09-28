@@ -19,8 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `hackney_pool.no_socket`, `hackney_pool.queue_count` and
   `hackney_pool.take_rate`, which hackney 4 can't provide.
 - Support for hackney 1.x. Use 0.2.0 with hackney 1.x.
-- The `mod_metrics` callbacks only hackney 1.x called: `new/2`, `delete/1`,
-  `decrement_counter/1,2`, `update_histogram/2` and `update_meter/2`.
+- The `mod_metrics` callbacks: `new/2`, `delete/1`, `increment_counter/1,2`,
+  `decrement_counter/1,2`, `update_histogram/2`, `update_meter/2` and
+  `update_gauge/2`. `hackney_telemetry` is now the middleware.
 - `hackney_telemetry_sup:start_worker/1` and `stop_worker/1`. Pool metrics are
   emitted by the poller instead of per-pool workers.
 

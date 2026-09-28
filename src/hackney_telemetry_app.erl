@@ -10,7 +10,7 @@
 -export([start/2, stop/1]).
 
 start(_StartType, _StartArgs) ->
-    ok = hackney_telemetry_middleware:install(),
+    ok = hackney_telemetry:install(),
     hackney_telemetry_sup:start_link().
 
 stop(_State) ->

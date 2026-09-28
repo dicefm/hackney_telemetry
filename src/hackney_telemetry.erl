@@ -1,48 +1,151 @@
-%%% @doc Updates the metrics that hackney_telemetry reports.
+%%% @doc Hackney middleware that reports request metrics.
 %%%
-%%% `hackney_telemetry_middleware' calls this module to update the request
-%%% metrics. Each metric has a `hackney_telemetry_worker' which keeps its
-%%% current value and generates Telemetry events.
+%%% The application adds `call/2' to hackney's global middleware chain when it
+%%% starts. The middleware updates these request metrics, each kept by a
+%%% `hackney_telemetry_worker':
 %%%
-%%% Metrics are identified by a name, which is a list of atoms, e.g.:
-%%%
-%%% - [hackney, total_requests]
 %%% - [hackney, nb_requests]
+%%% - [hackney, total_requests]
+%%% - [hackney, finished_requests]
+%%%
+%%% Requests in flight are kept in an ETS table with the process that made
+%%% them. A process can be killed before the middleware sees its request
+%%% finish, so `sweep/0' finishes the requests of dead processes and sets
+%%% `nb_requests' to the number still in flight. The pool poller calls it.
+%%%
+%%% It also wraps each request in a `[hackney, request]' span and emits
+%%% `[hackney, checkout_timeout]' when a request gets
+%%% `{error, checkout_timeout}'.
+%%%
+%%% Requests pass through untouched while the application isn't running.
 %%% @end
 
 -module(hackney_telemetry).
 
--export([
-    increment_counter/1, increment_counter/2,
-    update_gauge/2
-]).
+-export([install/0, uninstall/0, call/2, new_table/0, sweep/0]).
 
+-include_lib("hackney/include/hackney_lib.hrl").
 -include("hackney_telemetry.hrl").
 
-%% @doc Increment counter metric by 1.
+-define(REQUESTS, hackney_telemetry_requests).
 
--spec increment_counter(hackney_metric()) -> ok.
-increment_counter(Metric) ->
-    increment_counter(Metric, 1).
-
-%% @doc Increment counter metric by the given value.
-
--spec increment_counter(hackney_metric(), non_neg_integer()) -> ok.
-increment_counter(Metric, Value) ->
-    hackney_telemetry_worker:update(Metric, Value, fun sum/2),
-    ok.
-
-%% @doc Update gauge metric.
+%% @doc Add the middleware to the front of hackney's global chain.
 %%
-%% Gauges only keep the latest value, so we just need to replace the old state.
-%%
+%% Middleware already in the chain is kept.
 %% @end
 
--spec update_gauge(hackney_metric(), any()) -> ok.
-update_gauge(Metric, Value) ->
-    hackney_telemetry_worker:update(Metric, Value, fun replace/2).
+-spec install() -> ok.
+install() ->
+    application:set_env(hackney, middleware, [middleware() | other_middleware()]).
 
-%% Transform functions
+%% @doc Remove the middleware from hackney's global chain.
+
+-spec uninstall() -> ok.
+uninstall() ->
+    case other_middleware() of
+        [] -> application:unset_env(hackney, middleware);
+        Chain -> application:set_env(hackney, middleware, Chain)
+    end.
+
+%% @doc The hackney middleware. See `hackney_middleware'.
+
+-spec call(hackney_middleware:request(), hackney_middleware:next()) ->
+    hackney_middleware:response().
+call(Request, Next) ->
+    Ref = make_ref(),
+    try ets:insert(?REQUESTS, {Ref, self()}) of
+        true -> count(Ref, Request, Next)
+    catch
+        % The application isn't running.
+        error:badarg -> Next(Request)
+    end.
+
+%% @doc Create the table of requests in flight, owned by the calling process.
+
+-spec new_table() -> ok.
+new_table() ->
+    ?REQUESTS = ets:new(?REQUESTS, [
+        set, public, named_table, {write_concurrency, auto}, {decentralized_counters, true}
+    ]),
+    ok.
+
+%% @doc Finish the requests of dead processes and report `nb_requests'.
+
+-spec sweep() -> ok.
+sweep() ->
+    Dead = [Ref || {Ref, Pid} <- ets:tab2list(?REQUESTS), not is_process_alive(Pid)],
+    lists:foreach(fun(Ref) -> ets:delete(?REQUESTS, Ref) end, Dead),
+    Dead =/= [] andalso
+        increment([hackney, finished_requests], length(Dead)),
+    set([hackney, nb_requests], ets:info(?REQUESTS, size)).
+
+count(Ref, Request, Next) ->
+    increment([hackney, total_requests], 1),
+    try
+        span(Request, Next)
+    after
+        finish(Ref)
+    end.
+
+finish(Ref) ->
+    try
+        ets:delete(?REQUESTS, Ref)
+    catch
+        % The application stopped while the request was in flight.
+        error:badarg -> ok
+    end,
+    increment([hackney, finished_requests], 1).
+
+middleware() ->
+    fun ?MODULE:call/2.
+
+other_middleware() ->
+    case application:get_env(hackney, middleware) of
+        {ok, Chain} when is_list(Chain) -> lists:delete(middleware(), Chain);
+        _ -> []
+    end.
+
+span(#{method := Method, url := #hackney_url{host = Host}, options := Options} = Request, Next) ->
+    Metadata = #{method => Method, host => list_to_binary(Host), pool => pool(Options)},
+    telemetry:span([hackney, request], Metadata, fun() ->
+        Response = Next(Request),
+        Response =:= {error, checkout_timeout} andalso
+            telemetry:execute(
+                [hackney, checkout_timeout], #{count => 1}, maps:remove(method, Metadata)
+            ),
+        {Response, maps:merge(Metadata, response_metadata(Response))}
+    end).
+
+% Same rules hackney uses to pick the pool of a request.
+pool(Options) ->
+    case proplists:get_value(pool, Options) of
+        false ->
+            none;
+        undefined ->
+            case application:get_env(hackney, use_default_pool, true) of
+                false -> none;
+                _ -> default
+            end;
+        Pool ->
+            Pool
+    end.
+
+response_metadata({ok, Status, _Headers, _Body}) ->
+    #{status => Status};
+response_metadata({ok, Status, _Headers}) ->
+    #{status => Status};
+response_metadata({error, Reason}) ->
+    #{status => undefined, error => Reason};
+response_metadata(_Async) ->
+    #{status => undefined}.
+
+-spec increment(hackney_metric(), non_neg_integer()) -> ok.
+increment(Metric, Value) ->
+    hackney_telemetry_worker:update(Metric, Value, fun sum/2).
+
+-spec set(hackney_metric(), non_neg_integer()) -> ok.
+set(Metric, Value) ->
+    hackney_telemetry_worker:update(Metric, Value, fun replace/2).
 
 sum(StateValue, EventValue) ->
     StateValue + EventValue.

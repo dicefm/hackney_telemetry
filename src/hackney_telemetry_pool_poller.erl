@@ -12,7 +12,7 @@
 %%% doesn't delay the others. When a pool doesn't answer in time it emits
 %%% `[hackney_pool, stats_timeout]'.
 %%%
-%%% On each poll it also calls `hackney_telemetry_middleware:sweep/0'.
+%%% On each poll it also calls `hackney_telemetry:sweep/0'.
 %%%
 %%% It polls every `report_interval' milliseconds, or every second when
 %%% `report_interval' is 0.
@@ -63,7 +63,7 @@ handle_info(_Message, State) ->
     {noreply, State}.
 
 poll_pools() ->
-    hackney_telemetry_middleware:sweep(),
+    hackney_telemetry:sweep(),
     lists:foreach(fun(Pool) -> proc_lib:spawn(fun() -> report(Pool) end) end, pools()).
 
 % hackney has no function that lists pools, so read the table it keeps them in.
