@@ -1,150 +1,144 @@
-%%% @doc Telemetry adapter for Hackney metrics.
+%%% @doc Telemetry for hackney requests and connection pools.
 %%%
-%%% To use it, configure Hackney mod_metrics to use this module and
-%%% make sure that the hackney_telemetry application starts before your
-%%% application.
+%%% When the application starts it adds `call/2' to hackney's global
+%%% middleware chain and starts a reporter that calls `report/0' every
+%%% `report_interval' milliseconds.
 %%%
-%%% Hackney calls the module specified by mod_metrics to report
-%%% instrumentation metrics. This module receives the data from Hackney and
-%%% passes it to a hackney_telemetry_worker which keeps the current state of
-%%% the metric and generates Telemetry events.
+%%% The middleware wraps every `hackney:request/1..5' in a
+%%% `[hackney, request]' span, counts requests, and emits
+%%% `[hackney, checkout_timeout]' when a request gets
+%%% `{error, checkout_timeout}'.
 %%%
-%%% This module implements all the callbacks required by hackney_metrics.
-%%%
-%%% Hackney supports storing metrics in Folsom or Exometer. Unfortunately,
-%%% these libraries libraries do not export data in a way that is useful for
-%%% Telemetry, so we need to transform the metrics data before reporting it.
-%%%
-%%% Modules such as [Telemetry.Metrics](https://hex.pm/packages/telemetry_metrics)
-%%% can create gauges and histograms, so we just need to keep track of
-%%% metric values and report them to Telemetry.
-%%%
-%%% Metrics are identified by a name, which is a list of atoms or charlist
-%%% strings, e.g.:
-%%%
-%%% - [hackney, free_count]
-%%% - [hackney_pool, api_graphql, free_count]
-%%%
-%%% Metrics also have type: counter, histogram, gauge, or meter.
-%%%
-%%% For more information see:
-%%% - https://github.com/benoitc/hackney/blob/master/README.md#metrics
+%%% `report/0' emits the request counts as `[hackney]' and the stats of each
+%%% pool as `[hackney_pool]'. When a pool doesn't answer in time it emits
+%%% `[hackney_pool, stats_timeout]' instead.
 %%% @end
 
 -module(hackney_telemetry).
 
--export([
-    new/2,
-    delete/1,
-    increment_counter/1, increment_counter/2,
-    decrement_counter/1,
-    decrement_counter/2,
-    update_histogram/2,
-    update_meter/2,
-    update_gauge/2
-]).
+-export([install/0, uninstall/0, call/2, report/0]).
 
--include("hackney_telemetry.hrl").
+-include_lib("hackney/include/hackney_lib.hrl").
 
-%% @doc Create metric worker.
+-define(COUNTERS, {?MODULE, counters}).
+-define(IN_FLIGHT, 1).
+-define(TOTAL, 2).
+-define(FINISHED, 3).
+
+%% @doc Add the middleware to the front of hackney's global chain.
 %%
-%% Hackney calls this function when it creates a new pool. It spawns a worker
-%% process to handle the new metrics.
-%%
-%% Hackney general metrics are ignored here because they are already included
-%% in the hackney_telemetry_sup supervisor.
-%%
+%% Middleware already in the chain is kept. Calling it again changes nothing.
 %% @end
+-spec install() -> ok.
+install() ->
+    case persistent_term:get(?COUNTERS, undefined) of
+        undefined -> persistent_term:put(?COUNTERS, counters:new(3, [write_concurrency]));
+        _Counters -> ok
+    end,
+    application:set_env(hackney, middleware, [middleware() | other_middleware()]).
 
--spec new(metric_type(), hackney_metric()) -> ok.
-new(_Type, [hackney, _key]) ->
-    ok;
-new(_Type, [hackney_pool, PoolName, _] = Metric) when is_atom(PoolName) ->
-    hackney_telemetry_sup:start_worker(Metric);
-new(_Type, _Metric) ->
-    ok.
+%% @doc Remove the middleware from hackney's global chain.
+-spec uninstall() -> ok.
+uninstall() ->
+    case other_middleware() of
+        [] -> application:unset_env(hackney, middleware);
+        Chain -> application:set_env(hackney, middleware, Chain)
+    end.
 
-%% @doc Delete metric worker.
-
--spec delete(hackney_metric()) -> ok.
-delete(Metric) ->
-    hackney_telemetry_sup:stop_worker(Metric).
-
-%% @doc Increment counter metric by 1.
-
--spec increment_counter(hackney_metric()) -> ok.
-increment_counter(Metric) ->
-    increment_counter(Metric, 1).
-
-%% @doc Increment counter metric by the given value.
-
--spec increment_counter(hackney_metric(), non_neg_integer()) -> ok.
-increment_counter(Metric, Value) ->
-    hackney_telemetry_worker:update(Metric, Value, fun sum/2),
-    ok.
-
-%% @doc Decrement counter metric by 1.
-
--spec decrement_counter(hackney_metric()) -> ok.
-decrement_counter(Metric) ->
-    decrement_counter(Metric, 1).
-
-%% @doc Decrement counter metric by the given value.
-
--spec decrement_counter(hackney_metric(), non_neg_integer()) -> ok.
-decrement_counter(Metric, Value) ->
-    hackney_telemetry_worker:update(Metric, Value * -1, fun sum/2).
-
-%% @doc Update histogram metric.
-
--spec update_histogram(hackney_metric(), any()) -> ok.
-update_histogram(Metric, Fun) when is_function(Fun) ->
-    hackney_telemetry_worker:update(Metric, Fun, fun eval_and_replace/2);
-% In Hackney, the following metrics have their value off by -1:
-% - [hackney_pool, <pool_name>, free_count]
-% - [hackney_pool, <pool_name>, in_use_count]
-%
-% For these metrics, we fix their value by adding +1.
-%
-% Reference: https://github.com/benoitc/hackney/blob/592a00720cd1c8eb1edb6a6c9c8b8a4709c8b155/src/hackney_pool.erl#L597-L604
-update_histogram([hackney_pool, _, MetricName] = Metric, Value) ->
-    FixedValue =
-        case lists:member(MetricName, [in_use_count, free_count]) of
-            true ->
-                Value + 1;
-            false ->
-                Value
-        end,
-    hackney_telemetry_worker:update(Metric, FixedValue, fun replace/2);
-update_histogram(Metric, Value) ->
-    hackney_telemetry_worker:update(Metric, Value, fun replace/2).
-
-%% @doc Update meter metric.
+%% @doc The hackney middleware. See `hackney_middleware'.
 %%
-%% A meter is a type of counter that only goes forward.
+%% Requests pass through untouched until `install/0' has run.
 %% @end
+-spec call(hackney_middleware:request(), hackney_middleware:next()) ->
+    hackney_middleware:response().
+call(Request, Next) ->
+    case persistent_term:get(?COUNTERS, undefined) of
+        undefined -> Next(Request);
+        Counters -> count(Counters, Request, Next)
+    end.
 
--spec update_meter(hackney_metric(), any()) -> ok.
-update_meter(Metric, Value) ->
-    hackney_telemetry_worker:update(Metric, Value, fun sum/2).
+%% @doc Emit the request counts and the stats of every hackney pool.
+-spec report() -> ok.
+report() ->
+    report_requests(),
+    lists:foreach(fun({Pool, _Pid}) -> report_pool(Pool) end, ets:tab2list(hackney_pool)).
 
-%% @doc Update gauge metric.
-%%
-%% Gauges only keep the latest value, so we just need to replace the old state.
-%%
-%% @end
+%% Internal
 
--spec update_gauge(hackney_metric(), any()) -> ok.
-update_gauge(Metric, Value) ->
-    hackney_telemetry_worker:update(Metric, Value, fun replace/2).
+middleware() ->
+    fun ?MODULE:call/2.
 
-%% Transform functions
+other_middleware() ->
+    case application:get_env(hackney, middleware) of
+        {ok, Chain} when is_list(Chain) -> lists:delete(middleware(), Chain);
+        _ -> []
+    end.
 
-sum(StateValue, EventValue) ->
-    StateValue + EventValue.
+count(Counters, Request, Next) ->
+    counters:add(Counters, ?IN_FLIGHT, 1),
+    counters:add(Counters, ?TOTAL, 1),
+    try
+        span(Request, Next)
+    after
+        counters:sub(Counters, ?IN_FLIGHT, 1),
+        counters:add(Counters, ?FINISHED, 1)
+    end.
 
-replace(_StateValue, EventValue) ->
-    EventValue.
+span(#{method := Method, url := #hackney_url{host = Host}, options := Options} = Request, Next) ->
+    Metadata = #{
+        method => Method,
+        host => unicode:characters_to_binary(Host),
+        pool => proplists:get_value(pool, Options, default)
+    },
+    telemetry:span([hackney, request], Metadata, fun() ->
+        Response = Next(Request),
+        {Response, maps:merge(Metadata, response_metadata(Response, Metadata))}
+    end).
 
-eval_and_replace(_StateValue, Fun) ->
-    Fun().
+response_metadata({ok, Status, _Headers, _Body}, _Metadata) ->
+    #{status => Status};
+response_metadata({ok, Status, _Headers}, _Metadata) ->
+    #{status => Status};
+response_metadata({error, checkout_timeout}, Metadata) ->
+    telemetry:execute([hackney, checkout_timeout], #{count => 1}, maps:remove(method, Metadata)),
+    #{status => undefined, error => checkout_timeout};
+response_metadata({error, Reason}, _Metadata) ->
+    #{status => undefined, error => Reason};
+response_metadata(_Async, _Metadata) ->
+    #{status => undefined}.
+
+report_requests() ->
+    case persistent_term:get(?COUNTERS, undefined) of
+        undefined ->
+            ok;
+        Counters ->
+            telemetry:execute(
+                [hackney],
+                #{
+                    nb_requests => counters:get(Counters, ?IN_FLIGHT),
+                    total_requests => counters:get(Counters, ?TOTAL),
+                    finished_requests => counters:get(Counters, ?FINISHED)
+                },
+                #{}
+            )
+    end.
+
+report_pool(Pool) ->
+    try hackney_pool:get_stats(Pool) of
+        Stats ->
+            telemetry:execute(
+                [hackney_pool],
+                #{
+                    max => proplists:get_value(max, Stats),
+                    in_use_count => proplists:get_value(in_use_count, Stats),
+                    free_count => proplists:get_value(free_count, Stats)
+                },
+                #{pool => Pool}
+            )
+    catch
+        exit:{timeout, _} ->
+            telemetry:execute([hackney_pool, stats_timeout], #{count => 1}, #{pool => Pool});
+        % The pool stopped after it was listed.
+        exit:_ ->
+            ok
+    end.
