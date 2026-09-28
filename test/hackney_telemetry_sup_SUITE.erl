@@ -7,7 +7,7 @@
 %% Setup/Teardown functions
 
 all() ->
-    [starts_and_stops_workers].
+    [starts_request_workers_and_pool_poller].
 
 init_per_suite(Config) ->
     application:ensure_all_started([telemetry, hackney]),
@@ -29,13 +29,11 @@ end_per_testcase(_, Config) ->
 
 %% Tests
 
-starts_and_stops_workers(_Config) ->
-    Metric = [hackney, spool],
-    [_, _, _, _] = supervisor:which_children(hackney_telemetry_sup),
-    ok = hackney_telemetry_sup:start_worker(Metric),
-    [{{hackney_telemetry_worker, [hackney, spool]}, WorkerPid, _, _}, _, _, _, _] =
-        supervisor:which_children(hackney_telemetry_sup),
-    ok = hackney_telemetry_sup:stop_worker(Metric),
-    timer:sleep(15),
-    false = is_process_alive(WorkerPid),
-    [_, _, _, _] = supervisor:which_children(hackney_telemetry_sup).
+starts_request_workers_and_pool_poller(_Config) ->
+    Ids = [Id || {Id, _Pid, _Type, _Modules} <- supervisor:which_children(hackney_telemetry_sup)],
+    [
+        hackney_telemetry_pool_poller,
+        {hackney_telemetry_worker, [hackney, finished_requests]},
+        {hackney_telemetry_worker, [hackney, nb_requests]},
+        {hackney_telemetry_worker, [hackney, total_requests]}
+    ] = lists:sort(Ids).

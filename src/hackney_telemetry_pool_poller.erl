@@ -1,17 +1,16 @@
 %%% @doc Polls the stats of every hackney pool.
 %%%
-%%% Hackney 4 no longer calls a `mod_metrics' module, so this process reads
-%%% `hackney_pool:get_stats/1' and updates the pool metrics that hackney used
-%%% to update:
+%%% Hackney 4 no longer reports pool metrics, so this process reads
+%%% `hackney_pool:get_stats/1' and emits a `[hackney_pool]' event for each of
+%%% these measurements, with the pool in the metadata:
 %%%
-%%% - [hackney_pool, PoolName, max]
-%%% - [hackney_pool, PoolName, in_use_count]
-%%% - [hackney_pool, PoolName, free_count]
+%%% - max
+%%% - in_use_count
+%%% - free_count
 %%%
-%%% It starts a worker for each metric of a new pool and stops them once the
-%%% pool is gone. Each pool is polled in its own process, so a pool that
-%%% doesn't answer doesn't delay the others. When a pool doesn't answer in time
-%%% it emits `[hackney_pool, stats_timeout]'.
+%%% Each pool is polled in its own process, so a pool that doesn't answer
+%%% doesn't delay the others. When a pool doesn't answer in time it emits
+%%% `[hackney_pool, stats_timeout]'.
 %%%
 %%% On each poll it also calls `hackney_telemetry_middleware:sweep/0'.
 %%%
@@ -45,56 +44,46 @@ poll() ->
 
 init([]) ->
     schedule(),
-    {ok, []}.
+    {ok, undefined}.
 
-handle_call(poll, _From, Pools) ->
-    {reply, ok, poll(Pools)};
-handle_call(_Message, _From, Pools) ->
-    {reply, ok, Pools}.
+handle_call(poll, _From, State) ->
+    poll_pools(),
+    {reply, ok, State};
+handle_call(_Message, _From, State) ->
+    {reply, ok, State}.
 
-handle_cast(_Message, Pools) ->
-    {noreply, Pools}.
+handle_cast(_Message, State) ->
+    {noreply, State}.
 
-handle_info(poll, Pools) ->
+handle_info(poll, State) ->
     schedule(),
-    {noreply, poll(Pools)};
-handle_info(_Message, Pools) ->
-    {noreply, Pools}.
+    poll_pools(),
+    {noreply, State};
+handle_info(_Message, State) ->
+    {noreply, State}.
 
-poll(KnownPools) ->
+poll_pools() ->
     hackney_telemetry_middleware:sweep(),
-    Pools = pools(),
-    lists:foreach(
-        fun(Pool) -> for_each_metric(Pool, fun hackney_telemetry:delete/1) end, KnownPools -- Pools
-    ),
-    lists:foreach(
-        fun(Pool) ->
-            for_each_metric(Pool, fun(Metric) -> hackney_telemetry:new(gauge, Metric) end)
-        end,
-        Pools -- KnownPools
-    ),
-    lists:foreach(fun(Pool) -> proc_lib:spawn(fun() -> update(Pool) end) end, Pools),
-    Pools.
+    lists:foreach(fun(Pool) -> proc_lib:spawn(fun() -> report(Pool) end) end, pools()).
 
 % hackney has no function that lists pools, so read the table it keeps them in.
-% Only pools named by an atom get metrics, as in hackney_telemetry:new/2.
 pools() ->
     try ets:tab2list(hackney_pool) of
-        Entries -> [Pool || {Pool, _Pid} <- Entries, is_atom(Pool)]
+        Entries -> [Pool || {Pool, _Pid} <- Entries]
     catch
         error:badarg -> []
     end.
 
-for_each_metric(Pool, Fun) ->
-    lists:foreach(fun(Measurement) -> Fun([hackney_pool, Pool, Measurement]) end, ?MEASUREMENTS).
-
-update(Pool) ->
+report(Pool) ->
     try hackney_pool:get_stats(Pool) of
         Stats ->
             lists:foreach(
                 fun(Measurement) ->
-                    Value = proplists:get_value(Measurement, Stats),
-                    hackney_telemetry:update_gauge([hackney_pool, Pool, Measurement], Value)
+                    telemetry:execute(
+                        [hackney_pool],
+                        #{Measurement => proplists:get_value(Measurement, Stats)},
+                        #{pool => Pool}
+                    )
                 end,
                 ?MEASUREMENTS
             )

@@ -7,18 +7,18 @@
 %% Setup/Teardown functions
 
 all() ->
-    [creates_workers, telemetry_integration, fixes_value_shift_on_histograms].
+    [increments_counters, updates_gauges].
 
 init_per_suite(Config) ->
-    application:ensure_all_started(hackney_telemetry),
+    application:ensure_all_started(telemetry),
     Config.
 
 end_per_suite(Config) ->
-    application:stop(hackney_telemetry),
+    application:stop(telemetry),
     Config.
 
 init_per_testcase(_, Config) ->
-    ok = telemetry:attach("test_handler", [hackney_pool], fun send_to_self/4, self()),
+    ok = telemetry:attach("test_handler", [hackney], fun send_to_self/4, self()),
     Config.
 
 end_per_testcase(_, Config) ->
@@ -26,46 +26,31 @@ end_per_testcase(_, Config) ->
     Config.
 
 %% Tests
-%%
 
-creates_workers(_) ->
-    Metric = [hackney_pool, fool_pool],
-    undefined = global:whereis_name({node(), Metric}),
-    hackney_telemetry:new(gauge, Metric),
-    undefined =/= global:whereis_name({node(), Metric}).
-
-%%
-
-fixes_value_shift_on_histograms(_) ->
-    check_value_shift([hackney_pool, dull_pool, in_use_count], -1, 0),
-    check_value_shift([hackney_pool, dull_pool, free_count], -1, 0),
-    check_value_shift([hackney_pool, dull_pool, anything], 0, 0).
-
-check_value_shift([_, _, Key] = Metric, ReportValue, ExpectedValue) ->
+increments_counters(_) ->
+    Metric = [hackney, dull_counter],
     hackney_telemetry_worker:start_link([{metric, Metric}, {report_interval, 0}]),
-    hackney_telemetry:update_histogram(Metric, ReportValue),
-    receive
-        {telemetry_event, [hackney_pool], Measurement, #{pool := dull_pool}} ->
-            ExpectedValue = maps:get(Key, Measurement),
-            ok
-    after 10 ->
-        ct:fail(message_not_received)
-    end.
+    hackney_telemetry:increment_counter(Metric),
+    1 = receive_measurement(dull_counter),
+    hackney_telemetry:increment_counter(Metric, 5),
+    6 = receive_measurement(dull_counter).
 
-%%
-
-telemetry_integration(_) ->
-    Metric = [hackney_pool, dull_pool, in_use_count],
+updates_gauges(_) ->
+    Metric = [hackney, dull_gauge],
     hackney_telemetry_worker:start_link([{metric, Metric}, {report_interval, 0}]),
     hackney_telemetry:update_gauge(Metric, 10),
+    10 = receive_measurement(dull_gauge),
+    hackney_telemetry:update_gauge(Metric, 3),
+    3 = receive_measurement(dull_gauge).
+
+%% Helpers
+
+receive_measurement(Key) ->
     receive
-        {telemetry_event, [hackney_pool], #{in_use_count := 10}, #{pool := dull_pool}} ->
-            ok
+        {telemetry_event, [hackney], #{Key := Value}, #{}} -> Value
     after 10 ->
         ct:fail(message_not_received)
     end.
-
-%% Helpers
 
 send_to_self(Metric, Measurement, Metadata, TestPid) ->
     TestPid ! {telemetry_event, Metric, Measurement, Metadata},

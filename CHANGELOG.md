@@ -6,7 +6,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.3.0] - Unreleased
 ### Changed
-- Support hackney 4, which no longer calls `mod_metrics`. Requires hackney 4.8
+- Support hackney 4, which no longer reports metrics. Requires hackney 4.8
   and OTP 27. A middleware updates the request metrics and a poller reads
   `hackney_pool:get_stats/1` for the pool metrics.
 
@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 - `hackney_pool.no_socket`, `hackney_pool.queue_count` and
   `hackney_pool.take_rate`, which hackney 4 can't provide.
+- Support for hackney 1.x. Use 0.2.0 with hackney 1.x.
+- The `mod_metrics` callbacks only hackney 1.x called: `new/2`, `delete/1`,
+  `decrement_counter/1,2`, `update_histogram/2` and `update_meter/2`.
+- `hackney_telemetry_sup:start_worker/1` and `stop_worker/1`. Pool metrics are
+  emitted by the poller instead of per-pool workers.
 
 ## [0.2.0] - 2024-07-08
 ### Changed

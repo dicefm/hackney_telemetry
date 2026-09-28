@@ -9,19 +9,12 @@
 Telemetry adapter for Hackney metrics.
 
 > [!NOTE]
-> This version requires hackney 4.8. Hackney 4 no longer calls a `mod_metrics`
-> module, so this library adds a [middleware](https://hackney.hexdocs.pm/middleware.html)
-> that updates the request metrics and a poller that reads
-> `hackney_pool:get_stats/1` for the pool metrics. For hackney 1.x use 0.2.0.
+> This version requires hackney 4.8. For hackney 1.x use 0.2.0.
 
-This module is a [metrics handler](https://github.com/benoitc/hackney/blob/master/README.md#metrics)
-for the [Hackney](https://github.com/benoitc/hackney) HTTP client. It receives
-calls from Hackney to update metrics and generates [Telemetry](https://github.com/beam-telemetry/telemetry) events.
-
-Hackney supports storing metrics in [Folsom](https://hex.pm/packages/folsom) or
-[Exometer](https://hex.pm/packages/exometer_core). Unfortunately, these
-libraries do not export data in a way that is useful for Telemetry,
-so we need to transform the metrics data before reporting it.
+Hackney 4 no longer reports metrics itself. This library adds a
+[middleware](https://hackney.hexdocs.pm/middleware.html) to hackney that
+tracks requests, and a poller that reads `hackney_pool:get_stats/1`, and
+generates [Telemetry](https://github.com/beam-telemetry/telemetry) events.
 
 ## Telemetry metrics
 
@@ -36,10 +29,12 @@ The following metrics are exported by this library to telemetry.
 | `hackney_pool.free_count`   | pool | Number of free sockets in a connection pool           |
 | `hackney_pool.in_use_count` | pool | Number of busy sockets in a connection pool           |
 
-Pool metrics and `nb_requests` are read every `report_interval` (every second
-when it's 0). A request whose process is killed before it returns counts as
-finished at the next read. In
-hackney 4, `in_use_count` can go above `max`: `max` bounds the idle sockets,
+The poller reads the pools and `nb_requests` every `report_interval` (every
+second when it's 0). Pool metrics are emitted when they're read. `nb_requests`
+is reported by its worker, so it can be up to two intervals old. A request
+whose process is killed before it returns counts as finished at the next read.
+
+In hackney 4, `in_use_count` can go above `max`: `max` bounds the idle sockets,
 not the busy ones.
 
 Hackney 4 can't provide `hackney_pool.no_socket`, `hackney_pool.queue_count` or
@@ -62,10 +57,8 @@ for errors and for async or streaming requests. Don't use `error`, `reason` or
 To use it, make sure that the `hackney_telemetry` application starts before
 your application.
 
-The middleware and the pool poller call this module to update metrics, as
-hackney 1.x did through `mod_metrics`. This module passes the data to a
-`hackney_telemetry_worker` which keeps the current state of the metric and
-generates Telemetry events.
+The middleware passes request metrics to a `hackney_telemetry_worker`, which
+keeps the current state of the metric and generates Telemetry events.
 
 Requests that set their own `middleware` option replace hackney's global chain,
 so they are not counted.
@@ -74,12 +67,10 @@ A worker process has two jobs:
 
 1.  Calculate metric values
 
-    Hackney does not keep the state of its metrics, but instead emits events to
-    the metrics engine, like "increase this counter by 1", "set this gauge to X",
-    "add Y to this histogram". The job of a metric worker is to process these
-    events and keep up-to-date state representing the value of the tracked metric.
-    State updates run in constant time (O(1)), important since a single
-    request generates about nine metric updates.
+    The middleware sends updates like "increase this counter by 1" for every
+    request. The job of a metric worker is to process these updates and keep
+    up-to-date state representing the value of the tracked metric. State
+    updates run in constant time (O(1)).
 
 2.  Send metric values to Telemetry
 
@@ -105,7 +96,8 @@ when it starts.
 #### Report interval
 
 By default, workers will report data to telemetry every 1000 milliseconds.
-If set to 0, events are generated after every update.
+If set to 0, events are generated after every update. The poller uses the same
+interval, or every second when it's 0.
 
 You can change that by setting the `report_interval` option:
 

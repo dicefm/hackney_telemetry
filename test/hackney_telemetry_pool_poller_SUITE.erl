@@ -7,7 +7,7 @@
 all() ->
     [
         reports_pool_stats,
-        stops_workers_of_a_stopped_pool,
+        stops_reporting_a_stopped_pool,
         skips_pool_that_stopped,
         reports_pool_stats_timeout,
         polls_nothing_without_hackney,
@@ -55,14 +55,15 @@ reports_pool_stats(_Config) ->
         hackney_telemetry_pool_poller:poll()
     end.
 
-stops_workers_of_a_stopped_pool(_Config) ->
+stops_reporting_a_stopped_pool(_Config) ->
     Pool = unique_pool(),
     ok = hackney_pool:start_pool(Pool, []),
-    ok = hackney_telemetry_pool_poller:poll(),
-    true = is_pid(worker(Pool)),
     ok = hackney_pool:stop_pool(Pool),
     ok = hackney_telemetry_pool_poller:poll(),
-    undefined = worker(Pool).
+    receive
+        {[hackney_pool | _], _, #{pool := Pool}} = Event -> ct:fail({unexpected_event, Event})
+    after 50 -> ok
+    end.
 
 skips_pool_that_stopped(_Config) ->
     Pool = unique_pool(),
@@ -143,9 +144,6 @@ receive_measurement(Pool, Key) ->
         {[hackney_pool], #{Key := Value}, #{pool := Pool}} -> Value
     after 500 -> ct:fail({measurement_not_received, Pool, Key})
     end.
-
-worker(Pool) ->
-    global:whereis_name({node(), [hackney_pool, Pool, max]}).
 
 unique_pool() ->
     list_to_atom("hackney_telemetry_" ++ integer_to_list(erlang:unique_integer([positive]))).
