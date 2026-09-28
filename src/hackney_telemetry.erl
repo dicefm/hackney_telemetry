@@ -22,10 +22,9 @@
 
 -module(hackney_telemetry).
 
--export([install/0, uninstall/0, call/2, new_table/0, sweep/0]).
+-export([install/0, call/2, new_table/0, sweep/0]).
 
 -include_lib("hackney/include/hackney_lib.hrl").
--include("hackney_telemetry.hrl").
 
 -define(REQUESTS, hackney_telemetry_requests).
 -define(CHECKOUT_TIMEOUT_REPORTED, {?MODULE, checkout_timeout_reported}).
@@ -37,16 +36,9 @@
 
 -spec install() -> ok.
 install() ->
-    application:set_env(hackney, middleware, [middleware() | other_middleware()]).
-
-%% @doc Remove the middleware from hackney's global chain.
-
--spec uninstall() -> ok.
-uninstall() ->
-    case other_middleware() of
-        [] -> application:unset_env(hackney, middleware);
-        Chain -> application:set_env(hackney, middleware, Chain)
-    end.
+    Middleware = fun ?MODULE:call/2,
+    Chain = application:get_env(hackney, middleware, []),
+    application:set_env(hackney, middleware, [Middleware | lists:delete(Middleware, Chain)]).
 
 %% @doc The hackney middleware. See `hackney_middleware'.
 
@@ -102,15 +94,6 @@ finish(Ref) ->
         error:badarg -> ok
     end.
 
-middleware() ->
-    fun ?MODULE:call/2.
-
-other_middleware() ->
-    case application:get_env(hackney, middleware) of
-        {ok, Chain} when is_list(Chain) -> lists:delete(middleware(), Chain);
-        _ -> []
-    end.
-
 span(#{method := Method, url := #hackney_url{host = Host}, options := Options} = Request, Next) ->
     Metadata = #{method => Method, host => list_to_binary(Host), pool => pool(Options)},
     telemetry:span([hackney, request], Metadata, fun() ->
@@ -155,11 +138,9 @@ response_metadata({error, Reason}) ->
 response_metadata(_Async) ->
     #{status => undefined}.
 
--spec increment(hackney_metric(), non_neg_integer()) -> ok.
 increment(Metric, Value) ->
     hackney_telemetry_worker:update(Metric, Value, fun sum/2).
 
--spec set(hackney_metric(), non_neg_integer()) -> ok.
 set(Metric, Value) ->
     hackney_telemetry_worker:update(Metric, Value, fun replace/2).
 

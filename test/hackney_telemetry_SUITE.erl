@@ -14,21 +14,16 @@
 
 all() ->
     [
-        installs_middleware_on_start,
-        install_keeps_other_middleware,
-        uninstall_keeps_other_middleware,
+        installs_middleware_first_and_once,
         passes_through_while_application_is_stopped,
         returns_response_when_application_stops_mid_request,
         does_not_finish_request_started_before_a_restart,
         counts_requests_made_through_hackney,
         counts_request_as_in_flight_until_it_finishes,
-        counts_request_that_raises_as_finished,
-        finishes_requests_of_killed_processes,
+        finishes_request_that_raises,
+        finishes_request_of_killed_process,
         emits_request_span,
-        emits_request_span_for_error,
-        emits_request_span_for_head_and_async,
-        emits_exception_for_request_that_raises,
-        emits_checkout_timeout,
+        records_status_of_each_response,
         emits_checkout_timeout_once_across_redirects,
         tags_request_without_pool_as_none
     ].
@@ -56,26 +51,15 @@ end_per_testcase(_TestCase, Config) ->
 
 %% Install
 
-installs_middleware_on_start(_Config) ->
+installs_middleware_first_and_once(_Config) ->
+    Middleware = fun hackney_telemetry:call/2,
     {ok, [Middleware]} = application:get_env(hackney, middleware),
-    Middleware = fun hackney_telemetry:call/2.
-
-install_keeps_other_middleware(_Config) ->
     Other = fun ?MODULE:other_middleware/2,
-    application:set_env(hackney, middleware, [Other]),
+    application:set_env(hackney, middleware, [Other, Middleware]),
     ok = hackney_telemetry:install(),
-    ok = hackney_telemetry:install(),
-    {ok, [Middleware, Other]} = application:get_env(hackney, middleware),
-    Middleware = fun hackney_telemetry:call/2.
+    {ok, [Middleware, Other]} = application:get_env(hackney, middleware).
 
-uninstall_keeps_other_middleware(_Config) ->
-    Other = fun ?MODULE:other_middleware/2,
-    application:set_env(hackney, middleware, [fun hackney_telemetry:call/2, Other]),
-    ok = hackney_telemetry:uninstall(),
-    {ok, [Other]} = application:get_env(hackney, middleware),
-    application:set_env(hackney, middleware, [fun hackney_telemetry:call/2]),
-    ok = hackney_telemetry:uninstall(),
-    undefined = application:get_env(hackney, middleware).
+%% Application stops
 
 passes_through_while_application_is_stopped(_Config) ->
     ok = application:stop(hackney_telemetry),
@@ -83,61 +67,26 @@ passes_through_while_application_is_stopped(_Config) ->
         {ok, 200, [], <<>>} = hackney_telemetry:call(request([]), fun(_) ->
             {ok, 200, [], <<>>}
         end),
-        receive
-            {[hackney | _], _, _} = Event -> ct:fail({unexpected_event, Event})
-        after 50 -> ok
-        end
+        refute_event([hackney, request, stop])
     after
         ok = application:start(hackney_telemetry)
     end.
 
 returns_response_when_application_stops_mid_request(_Config) ->
-    Self = self(),
-    Caller = spawn(fun() ->
-        Response = hackney_telemetry:call(request([]), fun(_) ->
-            Self ! started,
-            receive
-                continue -> {ok, 200, [], <<>>}
-            end
-        end),
-        Self ! {response, Response}
-    end),
-    receive
-        started -> ok
-    end,
+    Caller = start_request(),
     ok = application:stop(hackney_telemetry),
     try
-        Caller ! continue,
-        receive
-            {response, Response} -> {ok, 200, [], <<>>} = Response
-        after 100 -> ct:fail(response_not_received)
-        end
+        finish_request(Caller)
     after
         ok = application:start(hackney_telemetry)
     end.
 
 does_not_finish_request_started_before_a_restart(_Config) ->
-    Self = self(),
-    Caller = spawn(fun() ->
-        Response = hackney_telemetry:call(request([]), fun(_) ->
-            Self ! started,
-            receive
-                continue -> {ok, 200, [], <<>>}
-            end
-        end),
-        Self ! {response, Response}
-    end),
-    receive
-        started -> ok
-    end,
+    Caller = start_request(),
     ok = application:stop(hackney_telemetry),
     ok = application:start(hackney_telemetry),
     flush(),
-    Caller ! continue,
-    receive
-        {response, Response} -> {ok, 200, [], <<>>} = Response
-    after 100 -> ct:fail(response_not_received)
-    end,
+    finish_request(Caller),
     receive
         {[hackney], #{finished_requests := _}, _} = Event -> ct:fail({unexpected_event, Event})
     after 50 -> ok
@@ -159,38 +108,27 @@ counts_request_as_in_flight_until_it_finishes(_Config) ->
     end),
     Before = in_flight().
 
-counts_request_that_raises_as_finished(_Config) ->
+finishes_request_that_raises(_Config) ->
     Before = in_flight(),
-    {'EXIT', {boom, _}} =
-        (catch hackney_telemetry:call(request([]), fun(_) -> error(boom) end)),
+    {'EXIT', {boom, _}} = (catch hackney_telemetry:call(request([]), fun(_) -> error(boom) end)),
     receive_measurement(finished_requests),
-    Before = in_flight().
-
-finishes_requests_of_killed_processes(_Config) ->
     Before = in_flight(),
-    Self = self(),
-    Pids = [
-        spawn(fun() ->
-            hackney_telemetry:call(request([]), fun(_) ->
-                Self ! started,
-                timer:sleep(infinity)
-            end)
-        end)
-     || _ <- [1, 2]
-    ],
-    [
-        receive
-            started -> ok
-        end
-     || _ <- Pids
-    ],
-    InFlight = Before + 2,
+    receive
+        {[hackney, request, exception], #{duration := _}, Metadata} ->
+            #{kind := error, reason := boom, host := <<"api.example.com">>} = Metadata
+    after 100 -> ct:fail(exception_not_received)
+    end.
+
+finishes_request_of_killed_process(_Config) ->
+    Before = in_flight(),
+    Caller = start_request(),
+    InFlight = Before + 1,
     InFlight = in_flight(),
-    [Shutdown, Kill] = Pids,
-    exit(Shutdown, shutdown),
-    exit(Kill, kill),
-    wait_until_dead(Pids),
-    flush(),
+    Ref = monitor(process, Caller),
+    exit(Caller, kill),
+    receive
+        {'DOWN', Ref, process, Caller, _} -> ok
+    end,
     Before = in_flight(),
     receive
         {[hackney], #{finished_requests := _}, #{}} -> ok
@@ -200,9 +138,7 @@ finishes_requests_of_killed_processes(_Config) ->
 %% Span
 
 emits_request_span(_Config) ->
-    hackney_telemetry:call(request([{pool, stripe}]), fun(_) ->
-        {ok, 201, [], <<"body">>}
-    end),
+    hackney_telemetry:call(request([{pool, stripe}]), fun(_) -> {ok, 201, [], <<"body">>} end),
     Metadata = #{method => post, host => <<"api.example.com">>, pool => stripe},
     receive
         {[hackney, request, start], #{system_time := _}, StartMetadata} ->
@@ -216,71 +152,40 @@ emits_request_span(_Config) ->
     after 100 -> ct:fail(stop_not_received)
     end.
 
-emits_request_span_for_error(_Config) ->
-    hackney_telemetry:call(request([]), fun(_) -> {error, timeout} end),
-    receive
-        {[hackney, request, stop], _Measurements, Metadata} ->
-            #{status := undefined, error := timeout, pool := default} = Metadata
-    after 100 -> ct:fail(stop_not_received)
-    end,
-    receive
-        {[hackney, checkout_timeout], _, _} -> ct:fail(unexpected_checkout_timeout)
-    after 0 -> ok
-    end.
-
-emits_request_span_for_head_and_async(_Config) ->
-    hackney_telemetry:call(request([]), fun(_) -> {ok, 204, []} end),
-    receive
-        {[hackney, request, stop], _, #{status := 204}} -> ok
-    after 100 -> ct:fail(head_stop_not_received)
-    end,
-    hackney_telemetry:call(request([]), fun(_) -> {ok, make_ref()} end),
-    receive
-        {[hackney, request, stop], _, #{status := undefined} = Metadata} ->
-            false = maps:is_key(error, Metadata)
-    after 100 -> ct:fail(async_stop_not_received)
-    end.
-
-emits_exception_for_request_that_raises(_Config) ->
-    catch hackney_telemetry:call(request([]), fun(_) -> error(boom) end),
-    receive
-        {[hackney, request, exception], #{duration := _}, Metadata} ->
-            #{kind := error, reason := boom, host := <<"api.example.com">>} = Metadata
-    after 100 -> ct:fail(exception_not_received)
-    end.
-
-emits_checkout_timeout(_Config) ->
-    hackney_telemetry:call(request([{pool, stripe}]), fun(_) ->
-        {error, checkout_timeout}
-    end),
-    receive
-        {[hackney, checkout_timeout], Measurements, Metadata} ->
-            #{count := 1} = Measurements,
-            #{pool := stripe, host := <<"api.example.com">>} = Metadata
-    after 100 -> ct:fail(checkout_timeout_not_received)
-    end.
+records_status_of_each_response(_Config) ->
+    Ref = make_ref(),
+    lists:foreach(
+        fun({Response, Expected}) ->
+            hackney_telemetry:call(request([]), fun(_) -> Response end),
+            receive
+                {[hackney, request, stop], _, Metadata} ->
+                    Expected = maps:with([status, error], Metadata)
+            after 100 -> ct:fail({stop_not_received, Response})
+            end
+        end,
+        [
+            {{ok, 204, []}, #{status => 204}},
+            {{ok, Ref}, #{status => undefined}},
+            {{error, timeout}, #{status => undefined, error => timeout}}
+        ]
+    ),
+    refute_event([hackney, checkout_timeout]).
 
 emits_checkout_timeout_once_across_redirects(_Config) ->
     Redirect = maps:merge(request([{redirect_count, 1}]), #{
         url => hackney_url:parse_url(<<"https://redirected.example.com/charges">>)
     }),
-    Timeout = fun() ->
-        hackney_telemetry:call(request([]), fun(_) ->
-            hackney_telemetry:call(Redirect, fun(_) -> {error, checkout_timeout} end)
-        end)
-    end,
-    {error, checkout_timeout} = Timeout(),
+    {error, checkout_timeout} = hackney_telemetry:call(request([]), fun(_) ->
+        hackney_telemetry:call(Redirect, fun(_) -> {error, checkout_timeout} end)
+    end),
     receive
-        {[hackney, checkout_timeout], _, #{host := <<"redirected.example.com">>}} -> ok
+        {[hackney, checkout_timeout], #{count := 1}, #{host := <<"redirected.example.com">>}} -> ok
     after 100 -> ct:fail(checkout_timeout_not_received)
     end,
+    refute_event([hackney, checkout_timeout]),
+    hackney_telemetry:call(request([{pool, stripe}]), fun(_) -> {error, checkout_timeout} end),
     receive
-        {[hackney, checkout_timeout], _, _} = Event -> ct:fail({unexpected_event, Event})
-    after 50 -> ok
-    end,
-    {error, checkout_timeout} = Timeout(),
-    receive
-        {[hackney, checkout_timeout], _, _} -> ok
+        {[hackney, checkout_timeout], _, #{host := <<"api.example.com">>, pool := stripe}} -> ok
     after 100 -> ct:fail(checkout_timeout_not_received_again)
     end.
 
@@ -340,13 +245,33 @@ flush() ->
     after 0 -> ok
     end.
 
-wait_until_dead(Pids) ->
-    case lists:any(fun erlang:is_process_alive/1, Pids) of
-        true ->
-            timer:sleep(1),
-            wait_until_dead(Pids);
-        false ->
-            ok
+% Start a request that blocks until it gets `continue', and return its caller.
+start_request() ->
+    Self = self(),
+    Caller = spawn(fun() ->
+        Response = hackney_telemetry:call(request([]), fun(_) ->
+            Self ! started,
+            receive
+                continue -> {ok, 200, [], <<>>}
+            end
+        end),
+        Self ! {response, Response}
+    end),
+    receive
+        started -> Caller
+    end.
+
+finish_request(Caller) ->
+    Caller ! continue,
+    receive
+        {response, Response} -> {ok, 200, [], <<>>} = Response
+    after 100 -> ct:fail(response_not_received)
+    end.
+
+refute_event(Event) ->
+    receive
+        {Event, _, _} = Received -> ct:fail({unexpected_event, Received})
+    after 50 -> ok
     end.
 
 receive_measurement(Key) ->

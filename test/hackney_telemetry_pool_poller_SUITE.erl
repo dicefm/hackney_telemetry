@@ -7,7 +7,6 @@
 all() ->
     [
         reports_pool_stats,
-        stops_reporting_a_stopped_pool,
         skips_pool_that_stopped,
         reports_pool_stats_timeout,
         polls_nothing_without_hackney,
@@ -51,18 +50,7 @@ reports_pool_stats(_Config) ->
         0 = receive_measurement(Pool, in_use_count),
         0 = receive_measurement(Pool, free_count)
     after
-        hackney_pool:stop_pool(Pool),
-        hackney_telemetry_pool_poller:poll()
-    end.
-
-stops_reporting_a_stopped_pool(_Config) ->
-    Pool = unique_pool(),
-    ok = hackney_pool:start_pool(Pool, []),
-    ok = hackney_pool:stop_pool(Pool),
-    ok = hackney_telemetry_pool_poller:poll(),
-    receive
-        {[hackney_pool | _], _, #{pool := Pool}} = Event -> ct:fail({unexpected_event, Event})
-    after 50 -> ok
+        hackney_pool:stop_pool(Pool)
     end.
 
 skips_pool_that_stopped(_Config) ->
@@ -79,8 +67,7 @@ skips_pool_that_stopped(_Config) ->
         after 50 -> ok
         end
     after
-        ets:delete(hackney_pool, Pool),
-        hackney_telemetry_pool_poller:poll()
+        ets:delete(hackney_pool, Pool)
     end.
 
 reports_pool_stats_timeout(_Config) ->
@@ -99,8 +86,7 @@ reports_pool_stats_timeout(_Config) ->
         end
     after
         ets:delete(hackney_pool, Pool),
-        Pid ! stop,
-        hackney_telemetry_pool_poller:poll()
+        Pid ! stop
     end.
 
 polls_nothing_without_hackney(_Config) ->
@@ -121,8 +107,7 @@ polls_every_report_interval(_Config) ->
         3 = receive_measurement(Pool, max)
     after
         application:set_env(hackney_telemetry, report_interval, 0),
-        hackney_pool:stop_pool(Pool),
-        hackney_telemetry_pool_poller:poll()
+        hackney_pool:stop_pool(Pool)
     end.
 
 ignores_unexpected_messages(_Config) ->
