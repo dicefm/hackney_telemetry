@@ -15,6 +15,7 @@
 all() ->
     [
         installs_middleware_first_and_once,
+        restarts_a_crashed_worker,
         passes_through_while_application_is_stopped,
         returns_response_when_application_stops_mid_request,
         does_not_finish_request_started_before_a_restart,
@@ -58,6 +59,19 @@ installs_middleware_first_and_once(_Config) ->
     application:set_env(hackney, middleware, [Other, Middleware]),
     ok = hackney_telemetry:install(),
     {ok, [Middleware, Other]} = application:get_env(hackney, middleware).
+
+restarts_a_crashed_worker(_Config) ->
+    Name = {node(), [hackney, total_requests]},
+    Pid = global:whereis_name(Name),
+    Ref = monitor(process, Pid),
+    exit(Pid, kill),
+    receive
+        {'DOWN', Ref, process, Pid, _} -> ok
+    end,
+    ok = wait_until(fun() -> is_pid(global:whereis_name(Name)) end),
+    true = global:whereis_name(Name) =/= Pid,
+    {ok, _} = application:get_env(hackney, middleware),
+    true = lists:keymember(hackney_telemetry, 1, application:which_applications()).
 
 %% Application stops
 
@@ -243,6 +257,20 @@ flush() ->
     receive
         {[hackney], _, _} -> flush()
     after 0 -> ok
+    end.
+
+wait_until(Fun) ->
+    wait_until(Fun, 100).
+
+wait_until(_Fun, 0) ->
+    ct:fail(condition_not_met);
+wait_until(Fun, Attempts) ->
+    case Fun() of
+        true ->
+            ok;
+        false ->
+            timer:sleep(5),
+            wait_until(Fun, Attempts - 1)
     end.
 
 % Start a request that blocks until it gets `continue', and return its caller.
